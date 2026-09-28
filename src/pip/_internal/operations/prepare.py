@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import mimetypes
 import os
-import shutil
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +22,7 @@ from pip._internal.exceptions import (
     HashMismatch,
     HashUnpinned,
     InstallationError,
+    InvalidWheelFilename,
     MetadataInconsistent,
     MetadataInvalid,
     NetworkConnectionError,
@@ -33,7 +33,7 @@ from pip._internal.index.package_finder import PackageFinder
 from pip._internal.metadata import BaseDistribution, get_metadata_distribution
 from pip._internal.models.direct_url import ArchiveInfo, DirectUrl
 from pip._internal.models.link import Link, join_within_directory
-from pip._internal.models.wheel import Wheel
+from pip._internal.models.wheel import Wheel, filename_with_build_tag
 from pip._internal.network.download import Downloader
 from pip._internal.network.lazy_wheel import (
     HTTPRangeRequestUnsupported,
@@ -46,6 +46,10 @@ from pip._internal.utils._log import getLogger
 from pip._internal.utils.direct_url_helpers import (
     direct_url_for_editable,
     direct_url_from_link,
+)
+from pip._internal.utils.filesystem import (
+    files_are_identical,
+    publish_file,
 )
 from pip._internal.utils.hashes import Hashes, MissingHashes
 from pip._internal.utils.logging import indent_log
@@ -197,6 +201,27 @@ def unpack_url(
     return file
 
 
+def _alternative_artifact_path(dest: str, src: str, index: int) -> str:
+    """Deterministic alternative name for a file that conflicts with ``dest``.
+
+    The name embeds a short hash of the new file's contents, so retries and
+    concurrent runs always derive the same name for the same contents.
+    Wheel file names stay valid by encoding the hash as a PEP 427 build tag;
+    other file names get a ``+sha256-<hash>`` infix before the extension.
+    """
+    directory, filename = os.path.split(dest)
+    digest, _ = hash_file(src)
+    digest_hex = digest.hexdigest()[:12]
+    if index:
+        digest_hex = f"{digest_hex}.{index}"
+    try:
+        alternative_name = filename_with_build_tag(filename, f"1{digest_hex}")
+    except InvalidWheelFilename:
+        stem, ext = os.path.splitext(filename)
+        alternative_name = f"{stem}+sha256-{digest_hex.replace('.', '-')}{ext}"
+    return os.path.join(directory, alternative_name)
+
+
 def _check_download_dir(
     link: Link,
     download_dir: str,
@@ -219,11 +244,34 @@ def _check_download_dir(
         except HashMismatch:
             if warn_on_hash_mismatch:
                 logger.warning(
-                    "Previously-downloaded file %s has bad hash. Re-downloading.",
+                    "Previously-downloaded file %s has bad hash. The existing "
+                    "file is left untouched and a new copy is downloaded.",
                     download_path,
                 )
-            os.unlink(download_path)
+            # Do not delete the existing file: it may be a user's file or a
+            # concurrently produced artifact. The freshly downloaded copy is
+            # published collision-safely later (in save_linked_requirement).
             return None
+        # A successful hash check fully identifies the expected contents, so
+        # the same-named file is safe to reuse as-is.
+        return download_path
+
+    # Without hashes, a local file:// link references a source that is
+    # available directly: a same-named file is only trusted when it is
+    # byte-identical to that source. This prevents a file with the expected
+    # name but different contents from being mistaken for the requested
+    # artifact.
+    if link.is_file and os.path.isfile(link.file_path):
+        if not files_are_identical(download_path, link.file_path):
+            logger.warning(
+                "Previously-downloaded file %s has different contents from "
+                "%s. The existing file is left untouched and a new copy is "
+                "downloaded.",
+                download_path,
+                link.file_path,
+            )
+            return None
+
     return download_path
 
 
@@ -805,10 +853,31 @@ class RequirementPreparer:
             return
 
         download_location = join_within_directory(self.download_dir, link.filename)
-        if not os.path.exists(download_location):
-            shutil.copy(req.local_file_path, download_location)
-            download_path = display_path(download_location)
-            logger.info("Saved %s", download_path)
+        published = publish_file(
+            req.local_file_path,
+            download_location,
+            alternative_name=_alternative_artifact_path,
+            # The freshly downloaded artifact has passed any requested hash
+            # verification, so it is authoritative: it takes the canonical
+            # name while a same-named file with different contents is
+            # preserved under a content-derived name instead of being
+            # deleted or silently reused.
+            incoming_wins=True,
+        )
+        if not published.created:
+            logger.debug(
+                "File already present with identical contents: %s",
+                display_path(published.path),
+            )
+        elif published.displaced_to is not None:
+            logger.warning(
+                "Saved %s; the existing file with different contents was "
+                "left in place as %s.",
+                display_path(published.path),
+                display_path(published.displaced_to),
+            )
+        else:
+            logger.info("Saved %s", display_path(published.path))
 
     def prepare_editable_requirement(
         self,

@@ -6,10 +6,77 @@ import pytest
 
 from pip._vendor.packaging.tags import Tag, interpreter_name, interpreter_version
 
+from pip._internal import cache as cache_module
 from pip._internal.cache import SimpleWheelCache, WheelCache, _hash_dict
+from pip._internal.models.direct_url import ArchiveInfo, DirectUrl
 from pip._internal.models.link import Link
 from pip._internal.utils.misc import ensure_dir
 from pip._internal.utils.urls import path_to_url
+
+
+def _direct_url(archive_hash: str) -> DirectUrl:
+    return DirectUrl(
+        url="https://g.c/package-1.0.tar.gz",
+        archive_info=ArchiveInfo(hashes={"sha256": archive_hash}),
+    )
+
+
+def test_record_download_origin_writes_atomically(tmp_path: Path) -> None:
+    info = _direct_url("a" * 64)
+    WheelCache.record_download_origin(str(tmp_path), info)
+
+    origin = tmp_path / "origin.json"
+    assert origin.exists()
+    assert DirectUrl.from_json(origin.read_text()) == info
+    # No temporary files or backups are left next to origin.json.
+    assert {p.name for p in tmp_path.glob("origin.json*")} == {"origin.json"}
+
+
+def test_record_download_origin_identical_is_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    info = _direct_url("a" * 64)
+    WheelCache.record_download_origin(str(tmp_path), info)
+
+    calls = []
+    real_write = cache_module._atomic_write_text
+
+    def counting_write(path: Path, text: str) -> None:
+        calls.append(path)
+        real_write(path, text)
+
+    monkeypatch.setattr(cache_module, "_atomic_write_text", counting_write)
+
+    # An identical payload reuses the existing origin.json verbatim.
+    WheelCache.record_download_origin(str(tmp_path), info)
+    assert calls == []
+
+
+def test_record_download_origin_preserves_conflicting_file(
+    tmp_path: Path,
+) -> None:
+    first = _direct_url("a" * 64)
+    second = _direct_url("b" * 64)
+    WheelCache.record_download_origin(str(tmp_path), first)
+    WheelCache.record_download_origin(str(tmp_path), second)
+
+    origin = tmp_path / "origin.json"
+    # The canonical file holds the new payload...
+    assert origin.read_text() == second.to_json()
+
+    # ...and the previous payload survives under a deterministic backup.
+    backups = list(tmp_path.glob("origin.json.sha256-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == first.to_json()
+
+    # Replacing the canonical file once more preserves the second payload as
+    # well; each distinct content gets exactly one backup.
+    WheelCache.record_download_origin(str(tmp_path), first)
+    backups = list(tmp_path.glob("origin.json.sha256-*"))
+    assert len(backups) == 2
+    preserved = {backup.read_text() for backup in backups}
+    assert preserved == {first.to_json(), second.to_json()}
+    assert origin.read_text() == first.to_json()
 
 
 def test_falsey_path_none() -> None:

@@ -15,10 +15,11 @@ from pip._internal.cache import WheelCache
 from pip._internal.exceptions import InvalidWheelFilename, UnsupportedWheel
 from pip._internal.metadata import FilesystemWheel, get_wheel_distribution
 from pip._internal.models.link import Link
-from pip._internal.models.wheel import Wheel
+from pip._internal.models.wheel import Wheel, filename_with_build_tag
 from pip._internal.operations.build.wheel import build_wheel_pep517
 from pip._internal.operations.build.wheel_editable import build_wheel_editable
 from pip._internal.req.req_install import InstallRequirement
+from pip._internal.utils.filesystem import publish_file
 from pip._internal.utils.logging import indent_log
 from pip._internal.utils.misc import ensure_dir, hash_file
 from pip._internal.utils.urls import path_to_url
@@ -87,6 +88,22 @@ def _get_cache_dir(
     else:
         cache_dir = wheel_cache.get_ephem_path_for_link(req.link)
     return cache_dir
+
+
+def _alternative_wheel_path(dest: str, src: str, index: int) -> str:
+    """Deterministic alternative name for a wheel that conflicts with ``dest``.
+
+    The hash of the new wheel is encoded as a PEP 427 build tag, which keeps
+    the alternative name a valid, cache-discoverable wheel file name. Same
+    contents always map to the same name, so retries and concurrent builds
+    converge instead of overwriting each other.
+    """
+    directory, wheel_name = os.path.split(dest)
+    wheel_hash, _ = hash_file(src)
+    digest_hex = wheel_hash.hexdigest()[:12]
+    build_tag = f"1{digest_hex}" if not index else f"1{digest_hex}.{index}"
+    alternative_name = filename_with_build_tag(wheel_name, build_tag)
+    return os.path.join(directory, alternative_name)
 
 
 def _verify_one(req: InstallRequirement, wheel_path: str) -> None:
@@ -181,20 +198,34 @@ def _build_one_inside_env(
             dest_path = os.path.join(output_dir, wheel_name)
             try:
                 wheel_hash, length = hash_file(wheel_path)
-                # We can do a replace here because wheel_path is guaranteed to
-                # be in the same filesystem as output_dir. This will perform an
-                # atomic rename, which is necessary to avoid concurrency issues
-                # when populating the cache.
-                os.replace(wheel_path, dest_path)
+                # Publish atomically, reusing an identically named wheel only
+                # when its contents are identical. If a same-named wheel with
+                # different contents is already present (e.g. produced by a
+                # concurrent build), it is left in place and the new wheel is
+                # stored under a deterministic content-derived name instead.
+                published = publish_file(
+                    wheel_path,
+                    dest_path,
+                    alternative_name=_alternative_wheel_path,
+                )
                 logger.info(
                     "Created wheel for %s: filename=%s size=%d sha256=%s",
                     req.name,
-                    wheel_name,
+                    os.path.basename(published.path),
                     length,
                     wheel_hash.hexdigest(),
                 )
+                if published.path != dest_path:
+                    logger.warning(
+                        "A wheel named %s with different contents already "
+                        "exists in %s; it was left in place and the newly "
+                        "built wheel was stored as %s.",
+                        wheel_name,
+                        output_dir,
+                        os.path.basename(published.path),
+                    )
                 logger.info("Stored in directory: %s", output_dir)
-                return dest_path
+                return published.path
             except Exception as e:
                 logger.warning(
                     "Building wheel for %s failed: %s",

@@ -78,3 +78,43 @@ class Wheel:
         :param tags: the PEP 425 tags to check the wheel against.
         """
         return not self.file_tags.isdisjoint(tags)
+
+
+def filename_with_build_tag(filename: str, build_tag: str) -> str:
+    """Return a wheel file name with its build tag segment set.
+
+    A PEP 427 wheel file name is ``{name}-{version}[-{build}]-{python}-
+    {abi}-{platform}.whl``; the build tag sits between the version and the
+    three compatibility tag segments. Any build tag already present is
+    extended with a ``.`` separator rather than duplicated, and the result
+    is validated as a wheel file name.
+    """
+    if not filename.endswith(".whl"):
+        raise InvalidWheelFilename(f"{filename!r} does not end in '.whl'")
+
+    stem = filename[:-4]
+    segments = stem.split("-")
+    if len(segments) == 5:
+        name, version, python_tag, abi_tag, platform_tag = segments
+        existing_build = None
+    elif len(segments) == 6:
+        (
+            name,
+            version,
+            existing_build,
+            python_tag,
+            abi_tag,
+            platform_tag,
+        ) = segments
+    else:
+        raise InvalidWheelFilename(f"{filename!r} is not a valid wheel filename")
+
+    full_build_tag = f"{existing_build}.{build_tag}" if existing_build else build_tag
+    new_filename = (
+        "-".join((name, version, full_build_tag, python_tag, abi_tag, platform_tag))
+        + ".whl"
+    )
+
+    # Validate the constructed name, including the supplied build tag.
+    Wheel(new_filename)
+    return new_filename

@@ -1,0 +1,12 @@
+Fix a class of issues where a file already present in the download or wheel
+cache directory could be mistaken for a downloaded or built artifact just
+because it had the expected name. Same-named files are now only reused when
+their contents are byte-identical (verified by size and SHA-256, or by the
+requested hash). When contents differ, the pre-existing file is never
+deleted or overwritten: verified downloads take the canonical name and the
+previous contents are preserved under a deterministic, content-derived file
+name (a PEP 427 build tag for wheels), while newly built wheels with
+conflicting names are stored under such an alternative name. File placement
+is atomic (hard link with cross-filesystem staging fallback), so retries and
+concurrent pip processes converge on identical results without clobbering
+each other's files.

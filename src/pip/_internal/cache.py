@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
 import json
 import logging
@@ -16,6 +18,13 @@ from pip._internal.exceptions import InvalidWheelFilename
 from pip._internal.models.direct_url import DirectUrl
 from pip._internal.models.link import Link
 from pip._internal.models.wheel import Wheel
+from pip._internal.utils.filesystem import (
+    adjacent_tmp_file,
+    files_are_identical,
+    publish_file,
+    replace,
+)
+from pip._internal.utils.misc import hash_file
 from pip._internal.utils.temp_dir import TempDirectory, tempdir_kinds
 from pip._internal.utils.urls import path_to_url
 
@@ -269,10 +278,11 @@ class WheelCache(Cache):
     @staticmethod
     def record_download_origin(cache_dir: str, download_info: DirectUrl) -> None:
         origin_path = Path(cache_dir) / ORIGIN_JSON_NAME
+        payload = download_info.to_json()
         if origin_path.exists():
             try:
-                origin = DirectUrl.from_json(origin_path.read_text(encoding="utf-8"))
-            except Exception as e:
+                existing_payload = origin_path.read_text(encoding="utf-8")
+            except OSError as e:
                 logger.warning(
                     "Could not read origin file %s in cache entry (%s). "
                     "Will attempt to overwrite it.",
@@ -280,15 +290,74 @@ class WheelCache(Cache):
                     e,
                 )
             else:
-                # TODO: use DirectUrl.equivalent when
-                # https://github.com/pypa/pip/pull/10564 is merged.
-                if origin.url != download_info.url:
+                if existing_payload == payload:
+                    # An identical origin file is already in place; leave it.
+                    return
+                try:
+                    origin = DirectUrl.from_json(existing_payload)
+                except Exception as e:
                     logger.warning(
-                        "Origin URL %s in cache entry %s does not match download URL "
-                        "%s. This is likely a pip bug or a cache corruption issue. "
-                        "Will overwrite it with the new value.",
-                        origin.url,
-                        cache_dir,
-                        download_info.url,
+                        "Ignoring invalid cache entry origin file %s (%s).",
+                        origin_path,
+                        e,
                     )
-        origin_path.write_text(download_info.to_json(), encoding="utf-8")
+                else:
+                    # TODO: use DirectUrl.equivalent when
+                    # https://github.com/pypa/pip/pull/10564 is merged.
+                    if origin.url != download_info.url:
+                        logger.warning(
+                            "Origin URL %s in cache entry %s does not match "
+                            "download URL %s. This is likely a pip bug or a "
+                            "cache corruption issue. The existing file is "
+                            "preserved and the new value written in its place.",
+                            origin.url,
+                            cache_dir,
+                            download_info.url,
+                        )
+                # Never destroy the conflicting origin file: preserve it under
+                # a deterministic, content-derived name before writing the new
+                # one.
+                _preserve_existing_file(origin_path)
+        _atomic_write_text(origin_path, payload)
+
+
+def _preserve_existing_file(path: Path) -> Path:
+    """Preserve ``path`` at a deterministic backup name without clobbering.
+
+    The backup name embeds a short hash of the preserved contents, so the
+    operation is idempotent under retries and safe when several processes
+    race: identical contents converge on the same backup.
+    """
+    digest, _ = hash_file(os.fspath(path))
+    token = digest.hexdigest()[:12]
+    for index in range(100):
+        suffix = "" if index == 0 else f".{index}"
+        backup = path.with_name(f"{path.name}.sha256-{token}{suffix}")
+        if backup.exists():
+            if files_are_identical(os.fspath(path), os.fspath(backup)):
+                return backup
+            continue
+        try:
+            publish_file(os.fspath(path), os.fspath(backup))
+        except FileExistsError:
+            # A concurrent process claimed the name; re-check its contents.
+            continue
+        return backup
+    raise OSError(
+        errno.EEXIST,
+        "Could not find a collision-free backup file name",
+        os.fspath(path),
+    )
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text to ``path`` atomically via an adjacent temporary file."""
+    with adjacent_tmp_file(os.fspath(path)) as f:
+        f.write(text.encode("utf-8"))
+        tmp_name = f.name
+    try:
+        replace(tmp_name, os.fspath(path))
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise

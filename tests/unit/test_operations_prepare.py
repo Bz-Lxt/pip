@@ -1,3 +1,4 @@
+import hashlib
 import os
 import shutil
 from pathlib import Path
@@ -17,9 +18,12 @@ from pip._internal.exceptions import (
 )
 from pip._internal.metadata import BaseDistribution, get_metadata_distribution
 from pip._internal.models.link import Link
+from pip._internal.models.wheel import Wheel
 from pip._internal.network.download import Downloader
 from pip._internal.network.session import PipSession
 from pip._internal.operations.prepare import (
+    _alternative_artifact_path,
+    _check_download_dir,
     _check_sidecar_matches_wheel,
     unpack_url,
 )
@@ -147,6 +151,133 @@ class Test_unpack_url:
                 hashes=Hashes({"md5": ["bogus"]}),
                 verbosity=0,
             )
+
+
+class TestCheckDownloadDir:
+    def test_missing_file_returns_none(self, tmp_path: Path) -> None:
+        link = Link("https://example.com/simple-1.0.tar.gz")
+        assert _check_download_dir(link, str(tmp_path), None) is None
+
+    def test_existing_file_reused_without_hashes(self, tmp_path: Path) -> None:
+        archive = tmp_path / "simple-1.0.tar.gz"
+        archive.write_bytes(b"archive")
+        link = Link("https://example.com/simple-1.0.tar.gz")
+        assert _check_download_dir(link, str(tmp_path), None) == str(archive)
+
+    def test_existing_file_reused_with_matching_hash(self, tmp_path: Path) -> None:
+        archive = tmp_path / "simple-1.0.tar.gz"
+        archive.write_bytes(b"archive")
+        digest = hashlib.sha256(b"archive").hexdigest()
+        link = Link(f"https://example.com/simple-1.0.tar.gz#sha256={digest}")
+        hashes = Hashes({"sha256": [digest]})
+        assert _check_download_dir(link, str(tmp_path), hashes) == str(archive)
+
+    def test_bad_hash_keeps_existing_file(self, tmp_path: Path) -> None:
+        archive = tmp_path / "simple-1.0.tar.gz"
+        archive.write_bytes(b"archive")
+        link = Link("https://example.com/simple-1.0.tar.gz#sha256=deadbeef")
+        hashes = Hashes({"sha256": ["deadbeef"]})
+        result = _check_download_dir(link, str(tmp_path), hashes)
+        assert result is None
+        # The conflicting file must not be deleted.
+        assert archive.read_bytes() == b"archive"
+
+    def test_bad_hash_warning_can_be_suppressed(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        archive = tmp_path / "simple-1.0.tar.gz"
+        archive.write_bytes(b"archive")
+        link = Link("https://example.com/simple-1.0.tar.gz#sha256=deadbeef")
+        hashes = Hashes({"sha256": ["deadbeef"]})
+        with caplog.at_level("WARNING"):
+            _check_download_dir(
+                link,
+                str(tmp_path),
+                hashes,
+                warn_on_hash_mismatch=False,
+            )
+        assert not caplog.records
+
+    def test_file_url_different_contents_not_reused(self, tmp_path: Path) -> None:
+        source = tmp_path / "source" / "simple-1.0.tar.gz"
+        source.parent.mkdir()
+        source.write_bytes(b"fresh contents")
+        archive = tmp_path / "download" / "simple-1.0.tar.gz"
+        archive.parent.mkdir()
+        archive.write_bytes(b"stale contents")
+
+        result = _check_download_dir(Link(source.as_uri()), str(archive.parent), None)
+
+        assert result is None
+        assert archive.read_bytes() == b"stale contents"
+
+    def test_file_url_identical_contents_reused(self, tmp_path: Path) -> None:
+        source = tmp_path / "source" / "simple-1.0.tar.gz"
+        source.parent.mkdir()
+        source.write_bytes(b"same contents")
+        archive = tmp_path / "download" / "simple-1.0.tar.gz"
+        archive.parent.mkdir()
+        archive.write_bytes(b"same contents")
+
+        result = _check_download_dir(Link(source.as_uri()), str(archive.parent), None)
+
+        assert result == str(archive)
+
+    def test_file_url_matching_hash_trumps_source_identity(
+        self, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "source" / "simple-1.0.tar.gz"
+        source.parent.mkdir()
+        source.write_bytes(b"fresh contents")
+        archive = tmp_path / "download" / "simple-1.0.tar.gz"
+        archive.parent.mkdir()
+        archive.write_bytes(b"stale contents")
+        # The expected hash describes the pre-existing file, not the source.
+        digest = hashlib.sha256(b"stale contents").hexdigest()
+        link = Link(f"{source.as_uri()}#sha256={digest}")
+        hashes = Hashes({"sha256": [digest]})
+
+        result = _check_download_dir(link, str(archive.parent), hashes)
+
+        # The hash contract is satisfied; the same-named file is reused and
+        # not compared against the file:// source.
+        assert result == str(archive)
+
+
+class TestAlternativeArtifactPath:
+    def test_wheel_uses_valid_build_tag(self, tmp_path: Path) -> None:
+        token = hashlib.sha256(b"wheel contents").hexdigest()[:12]
+        src = tmp_path / "src.whl"
+        src.write_bytes(b"wheel contents")
+        dest = str(tmp_path / "simple-1.0-py3-none-any.whl")
+        alternative = _alternative_artifact_path(dest, str(src), 0)
+        assert os.path.basename(alternative) == (
+            f"simple-1.0-1{token}-py3-none-any.whl"
+        )
+        wheel = Wheel(os.path.basename(alternative))
+        assert wheel.name == "simple"
+        assert wheel.version == "1.0"
+        number, suffix = wheel.build_tag
+        assert f"{number}{suffix}" == f"1{token}"
+
+    def test_non_wheel_uses_hash_infix(self, tmp_path: Path) -> None:
+        src = tmp_path / "src.tar.gz"
+        src.write_bytes(b"sdist contents")
+        dest = str(tmp_path / "simple-1.0.tar.gz")
+        alternative = _alternative_artifact_path(dest, str(src), 0)
+        assert os.path.basename(alternative).startswith("simple-1.0.tar+sha256-")
+        assert alternative.endswith(".gz")
+
+    def test_name_is_deterministic_and_indexed(self, tmp_path: Path) -> None:
+        src = tmp_path / "src"
+        src.write_bytes(b"contents")
+        dest = str(tmp_path / "artifact")
+        first = _alternative_artifact_path(dest, str(src), 0)
+        second = _alternative_artifact_path(dest, str(src), 0)
+        indexed = _alternative_artifact_path(dest, str(src), 1)
+        assert first == second
+        assert indexed != first
+        assert indexed.endswith("-1")
 
 
 def _metadata(*lines: str, name: str = "pkg", version: str = "1.0") -> str:

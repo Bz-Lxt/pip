@@ -80,3 +80,32 @@ def test_should_not_cache_local_directory(tmpdir: Path, name: str) -> None:
     project_dir.mkdir()
     req = ReqMock(link=Link(path_to_url(str(project_dir))))
     assert not wheel_builder._should_cache(cast(InstallRequirement, req))
+
+
+def test_alternative_wheel_path_is_deterministic_and_valid(tmpdir: Path) -> None:
+    import hashlib
+
+    from pip._internal.models.wheel import Wheel
+
+    payload = b"wheel contents"
+    src = tmpdir / "built.whl"
+    src.write_bytes(payload)
+    dest = str(tmpdir / "package-1.0-py3-none-any.whl")
+
+    token = hashlib.sha256(payload).hexdigest()[:12]
+    expected = f"package-1.0-1{token}-py3-none-any.whl"
+    expected_indexed = f"package-1.0-1{token}.1-py3-none-any.whl"
+
+    first = wheel_builder._alternative_wheel_path(dest, str(src), 0)
+    second = wheel_builder._alternative_wheel_path(dest, str(src), 0)
+    indexed = wheel_builder._alternative_wheel_path(dest, str(src), 1)
+
+    assert first == second
+    assert os.path.basename(first) == expected
+    assert os.path.basename(indexed) == expected_indexed
+    # Both names stay valid PEP 427 wheel file names.
+    for name in (first, indexed):
+        wheel = Wheel(os.path.basename(name))
+        assert wheel.name == "package"
+        assert wheel.version == "1.0"
+        assert wheel.build_tag is not None

@@ -1127,6 +1127,7 @@ def test_download_file_url_existing_bad_download(
     downloaded_path = download_dir / "simple-1.0.tar.gz"
     fake_existing_package = shared_data.packages / "simple-2.0.tar.gz"
     shutil.copy(str(fake_existing_package), str(downloaded_path))
+    existing_bytes = downloaded_path.read_bytes()
 
     simple_pkg = shared_data.packages / "simple-1.0.tar.gz"
     simple_pkg_bytes = simple_pkg.read_bytes()
@@ -1143,7 +1144,12 @@ def test_download_file_url_existing_bad_download(
 
     assert simple_pkg_bytes == downloaded_path.read_bytes()
     assert "WARNING: Previously-downloaded file" in result.stderr
-    assert "has bad hash. Re-downloading." in result.stderr
+    assert "has bad hash" in result.stderr
+    # The conflicting pre-existing file is not deleted: it is preserved
+    # under a deterministic, content-derived alternative name.
+    preserved = list(download_dir.glob("simple-1.0.tar+sha256-*.gz"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == existing_bytes
 
 
 def test_download_http_url_bad_hash(
@@ -1160,6 +1166,7 @@ def test_download_http_url_bad_hash(
     downloaded_path = download_dir / "simple-1.0.tar.gz"
     fake_existing_package = shared_data.packages / "simple-2.0.tar.gz"
     shutil.copy(str(fake_existing_package), str(downloaded_path))
+    existing_bytes = downloaded_path.read_bytes()
 
     simple_pkg = shared_data.packages / "simple-1.0.tar.gz"
     simple_pkg_bytes = simple_pkg.read_bytes()
@@ -1180,7 +1187,12 @@ def test_download_http_url_bad_hash(
 
     assert simple_pkg_bytes == downloaded_path.read_bytes()
     assert "WARNING: Previously-downloaded file" in result.stderr
-    assert "has bad hash. Re-downloading." in result.stderr
+    assert "has bad hash" in result.stderr
+    # The conflicting pre-existing file is not deleted: it is preserved
+    # under a deterministic, content-derived alternative name.
+    preserved = list(download_dir.glob("simple-1.0.tar+sha256-*.gz"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == existing_bytes
 
     mock_server.stop()
     requests = mock_server.get_requests()

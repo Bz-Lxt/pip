@@ -3,8 +3,43 @@ import pytest
 from pip._vendor.packaging.tags import Tag
 
 from pip._internal.exceptions import InvalidWheelFilename
-from pip._internal.models.wheel import Wheel
+from pip._internal.models.wheel import Wheel, filename_with_build_tag
 from pip._internal.utils import compatibility_tags
+
+
+class TestFilenameWithBuildTag:
+    def test_adds_build_tag(self) -> None:
+        assert (
+            filename_with_build_tag("simple-1.0-py3-none-any.whl", "1abcdef")
+            == "simple-1.0-1abcdef-py3-none-any.whl"
+        )
+
+    def test_preserves_compressed_tags(self) -> None:
+        assert (
+            filename_with_build_tag("simple-1.0-py2.py3-none-any.whl", "1abcdef")
+            == "simple-1.0-1abcdef-py2.py3-none-any.whl"
+        )
+
+    def test_extends_existing_build_tag(self) -> None:
+        assert (
+            filename_with_build_tag("simple-1.0-4-py3-none-any.whl", "1abcdef")
+            == "simple-1.0-4.1abcdef-py3-none-any.whl"
+        )
+
+    def test_result_is_a_valid_wheel_filename(self) -> None:
+        renamed = filename_with_build_tag(
+            "simple-1.0-cp313-abi3-android_21_x86_64.whl", "1abcdef123456"
+        )
+        wheel = Wheel(renamed)
+        assert wheel.name == "simple"
+        assert wheel.version == "1.0"
+        assert wheel.build_tag == (1, "abcdef123456")
+
+    def test_invalid_filename_raises(self) -> None:
+        with pytest.raises(InvalidWheelFilename):
+            filename_with_build_tag("not-a-wheel", "1abcdef")
+        with pytest.raises(InvalidWheelFilename):
+            filename_with_build_tag("invalid.whl", "1abcdef")
 
 
 class TestWheelFile:
