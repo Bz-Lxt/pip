@@ -11,6 +11,8 @@ import pytest
 from pip._internal.cli.cmdoptions import (
     _convert_python_version,
     _handle_uploaded_prior_to,
+    max_unpacked_bytes,
+    max_unpacked_files,
 )
 from pip._internal.cli.main_parser import identify_python_interpreter
 
@@ -56,6 +58,47 @@ def test_identify_python_interpreter_venv(tmpdir: Path) -> None:
 
     # Passing a non-existent file returns None
     assert identify_python_interpreter(str(tmpdir / "nonexistent")) is None
+
+
+@pytest.mark.parametrize(
+    "option_factory, flag",
+    [
+        (max_unpacked_bytes, "--max-unpacked-bytes"),
+        (max_unpacked_files, "--max-unpacked-files"),
+    ],
+)
+def test_max_unpacked_options_parse_non_negative_int(
+    option_factory: object, flag: str
+) -> None:
+    parser = OptionParser()
+    parser.add_option(option_factory())  # type: ignore[operator]
+    options, args = parser.parse_args([flag, "1234"])
+    assert getattr(options, "max_unpacked_bytes", None) == 1234 or (
+        getattr(options, "max_unpacked_files", None) == 1234
+    )
+
+    # Defaults to unlimited.
+    default_options, _ = parser.parse_args([])
+    dest = "max_unpacked_bytes" if flag.endswith("bytes") else "max_unpacked_files"
+    assert getattr(default_options, dest) is None
+    assert args == []
+
+
+@pytest.mark.parametrize(
+    "option_factory, flag",
+    [
+        (max_unpacked_bytes, "--max-unpacked-bytes"),
+        (max_unpacked_files, "--max-unpacked-files"),
+    ],
+)
+@pytest.mark.parametrize("bad_value", ["-1", "nope", "12.5"])
+def test_max_unpacked_options_reject_invalid_values(
+    option_factory: object, flag: str, bad_value: str
+) -> None:
+    parser = OptionParser()
+    parser.add_option(option_factory())  # type: ignore[operator]
+    with pytest.raises(SystemExit):
+        parser.parse_args([flag, bad_value])
 
 
 @pytest.mark.parametrize(

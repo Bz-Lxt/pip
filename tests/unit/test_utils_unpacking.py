@@ -17,8 +17,12 @@ from _pytest.monkeypatch import MonkeyPatch
 
 from pip._internal.exceptions import InstallationError
 from pip._internal.utils.unpacking import (
+    ExtractionLimitsExceeded,
     _get_default_mode_plus_executable,
+    current_extraction_budget,
+    extraction_limits,
     is_within_directory,
+    reserve_wheel_extraction,
     unpack_file,
     untar_file,
     unzip_file,
@@ -740,3 +744,155 @@ def test_polyglot_ambiguous_name_rejected(tmp_path: Path) -> None:
     _write_polyglot(archive)
     with pytest.raises(InstallationError):
         unpack_file(str(archive), str(tmp_path / "out"))
+
+
+def _make_zip_archive(
+    path: Path, entries: list[tuple[str, bytes | None]]
+) -> Path:
+    """Create a zip archive; ``None`` content marks a directory entry."""
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, content in entries:
+            if content is None:
+                zf.writestr(name + "/", b"")
+            else:
+                zf.writestr(name, content)
+    return path
+
+
+def _make_tar_archive(path: Path, entries: list[tuple[str, bytes]]) -> Path:
+    with tarfile.open(path, "w") as tf:
+        for name, content in entries:
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            tf.addfile(info, io.BytesIO(content))
+    return path
+
+
+class TestExtractionLimits:
+    def test_limits_unset_by_default(self) -> None:
+        assert current_extraction_budget() is None
+
+    def test_context_resets_budget_on_exit(self, tmp_path: Path) -> None:
+        archive = _make_zip_archive(
+            tmp_path / "a.zip", [("pkg/a.txt", b"x" * 10)]
+        )
+        with extraction_limits(100, 100):
+            assert current_extraction_budget() is not None
+            unpack_file(str(archive), str(tmp_path / "out"))
+            assert (tmp_path / "out" / "a.txt").read_bytes() == b"x" * 10
+        assert current_extraction_budget() is None
+
+        # Without an active budget the same archive unpacks without limits.
+        unpack_file(str(archive), str(tmp_path / "out2"))
+        assert (tmp_path / "out2" / "a.txt").read_bytes() == b"x" * 10
+
+    def test_bytes_limit_accumulates_across_archives(self, tmp_path: Path) -> None:
+        entries = [("a.txt", b"a" * 10), ("b.txt", b"b" * 10)]
+        archive1 = _make_zip_archive(tmp_path / "a.zip", entries)
+        archive2 = _make_zip_archive(tmp_path / "b.zip", entries)
+
+        with extraction_limits(max_bytes=25, max_files=None):
+            unpack_file(str(archive1), str(tmp_path / "out1"))
+            budget = current_extraction_budget()
+            assert budget is not None
+            assert budget.used_bytes == 20
+
+            with pytest.raises(ExtractionLimitsExceeded) as exc:
+                unpack_file(str(archive2), str(tmp_path / "out2"))
+
+        assert exc.value.kind == "bytes"
+        assert exc.value.used == 30
+        # The partially extracted second archive was removed immediately.
+        assert not (tmp_path / "out2").exists()
+        # The first, in-limit extraction is left untouched.
+        assert (tmp_path / "out1" / "a.txt").read_bytes() == b"a" * 10
+
+    def test_file_count_limit(self, tmp_path: Path) -> None:
+        archive = _make_zip_archive(
+            tmp_path / "many.zip",
+            [("a.txt", b"a"), ("dir", None), ("dir/b.txt", b"b")],
+        )
+        with extraction_limits(max_bytes=None, max_files=1):
+            with pytest.raises(ExtractionLimitsExceeded) as exc:
+                unpack_file(str(archive), str(tmp_path / "out"))
+
+        assert exc.value.kind == "files"
+        assert exc.value.used == 2
+        assert not (tmp_path / "out").exists()
+
+    def test_single_oversized_member_never_written(self, tmp_path: Path) -> None:
+        archive = _make_zip_archive(
+            tmp_path / "big.zip", [("pkg/big.bin", b"x" * 1000)]
+        )
+        with extraction_limits(max_bytes=100, max_files=None):
+            with pytest.raises(ExtractionLimitsExceeded) as exc:
+                unpack_file(str(archive), str(tmp_path / "out"))
+
+        assert exc.value.kind == "bytes"
+        assert not (tmp_path / "out").exists()
+
+    def test_tar_bytes_limit(self, tmp_path: Path) -> None:
+        archive = _make_tar_archive(
+            tmp_path / "a.tar",
+            [("pkg/a.txt", b"a" * 40), ("pkg/b.txt", b"b" * 40)],
+        )
+        with extraction_limits(max_bytes=50, max_files=None):
+            with pytest.raises(ExtractionLimitsExceeded) as exc:
+                unpack_file(str(archive), str(tmp_path / "out"))
+
+        assert exc.value.kind == "bytes"
+        assert not (tmp_path / "out").exists()
+
+    def test_within_limits_unpacks_normally(self, tmp_path: Path) -> None:
+        archive = _make_tar_archive(
+            tmp_path / "a.tar", [("pkg/a.txt", b"a" * 10)]
+        )
+        with extraction_limits(max_bytes=10, max_files=1):
+            unpack_file(str(archive), str(tmp_path / "out"))
+            budget = current_extraction_budget()
+            assert budget is not None
+            assert budget.used_bytes == 10
+            assert budget.used_files == 1
+        assert (tmp_path / "out" / "a.txt").read_bytes() == b"a" * 10
+
+    def test_reserve_wheel_counts_and_dedupes(self, tmp_path: Path) -> None:
+        wheel = _make_zip_archive(
+            tmp_path / "pkg-1-py3-none-any.whl",
+            [
+                ("pkg/__init__.py", b"x" * 10),
+                ("pkg/data.py", b"y" * 20),
+                ("pkg-1.dist-info", None),
+                ("pkg-1.dist-info/METADATA", b"m" * 5),
+            ],
+        )
+        published = tmp_path / "cache" / "pkg-1-py3-none-any.whl"
+
+        with extraction_limits(max_bytes=10_000, max_files=10_000):
+            reserve_wheel_extraction(str(wheel), key_path=str(published))
+            budget = current_extraction_budget()
+            assert budget is not None
+            assert budget.used_bytes == 35
+            # Directory entries do not count as files in wheel metadata.
+            assert budget.used_files == 3
+
+            # Reserving again (even via the not-yet-existing published path)
+            # must not double count.
+            reserve_wheel_extraction(str(published))
+            assert budget.used_bytes == 35
+            assert budget.used_files == 3
+
+    def test_reserve_wheel_rejects_oversized(self, tmp_path: Path) -> None:
+        wheel = _make_zip_archive(
+            tmp_path / "pkg-1-py3-none-any.whl", [("pkg/big.py", b"z" * 99)]
+        )
+        with extraction_limits(max_bytes=10, max_files=None):
+            with pytest.raises(ExtractionLimitsExceeded) as exc:
+                reserve_wheel_extraction(str(wheel))
+        assert exc.value.kind == "bytes"
+        assert exc.value.used == 99
+
+    def test_reserve_wheel_without_budget_is_noop(self, tmp_path: Path) -> None:
+        wheel = _make_zip_archive(
+            tmp_path / "pkg-1-py3-none-any.whl", [("pkg/a.py", b"a")]
+        )
+        reserve_wheel_extraction(str(wheel))

@@ -38,6 +38,7 @@ from pip._internal.utils.logging import BrokenStdoutLoggingError, setup_logging
 from pip._internal.utils.misc import get_prog, normalize_path
 from pip._internal.utils.temp_dir import TempDirectoryTypeRegistry as TempDirRegistry
 from pip._internal.utils.temp_dir import global_tempdir_manager, tempdir_registry
+from pip._internal.utils.unpacking import extraction_limits
 from pip._internal.utils.virtualenv import running_under_virtualenv
 
 __all__ = ["Command"]
@@ -187,6 +188,16 @@ class Command(CommandContextMixIn):
         self.enter_context(global_tempdir_manager())
 
         options, args = self.parse_args(args)
+
+        # Apply the command-wide limits on expanded archive content, if any.
+        # Entered before the command runs so every sdist unpacked and every
+        # wheel installed by this command shares the same budget.
+        self.enter_context(
+            extraction_limits(
+                getattr(options, "max_unpacked_bytes", None),
+                getattr(options, "max_unpacked_files", None),
+            )
+        )
 
         # Set verbosity so that it can be used elsewhere.
         self.verbosity = options.verbose - options.quiet

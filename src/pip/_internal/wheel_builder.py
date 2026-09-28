@@ -21,6 +21,10 @@ from pip._internal.operations.build.wheel_editable import build_wheel_editable
 from pip._internal.req.req_install import InstallRequirement
 from pip._internal.utils.logging import indent_log
 from pip._internal.utils.misc import ensure_dir, hash_file
+from pip._internal.utils.unpacking import (
+    ExtractionLimitsExceeded,
+    reserve_wheel_extraction,
+)
 from pip._internal.utils.urls import path_to_url
 from pip._internal.vcs import vcs
 
@@ -181,6 +185,12 @@ def _build_one_inside_env(
             dest_path = os.path.join(output_dir, wheel_name)
             try:
                 wheel_hash, length = hash_file(wheel_path)
+                # Account for the wheel's expanded content before publishing
+                # it to the cache. If the command-wide extraction limits would
+                # be exceeded, the wheel stays in the build's temporary
+                # directory (removed on exit) and is neither cached nor
+                # installed.
+                reserve_wheel_extraction(wheel_path, key_path=dest_path)
                 # We can do a replace here because wheel_path is guaranteed to
                 # be in the same filesystem as output_dir. This will perform an
                 # atomic rename, which is necessary to avoid concurrency issues
@@ -195,6 +205,10 @@ def _build_one_inside_env(
                 )
                 logger.info("Stored in directory: %s", output_dir)
                 return dest_path
+            except ExtractionLimitsExceeded:
+                # This is a command-aborting condition, not an ordinary build
+                # failure, so propagate it instead of recording a build failure.
+                raise
             except Exception as e:
                 logger.warning(
                     "Building wheel for %s failed: %s",

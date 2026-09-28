@@ -60,6 +60,7 @@ from pip._internal.utils.misc import (
     write_output,
 )
 from pip._internal.utils.temp_dir import TempDirectory
+from pip._internal.utils.unpacking import reserve_wheel_extraction
 from pip._internal.utils.virtualenv import (
     running_under_virtualenv,
     virtualenv_no_global,
@@ -531,6 +532,17 @@ class InstallCommand(RequirementCommand):
                 raise InstallWheelBuildError(build_failures)
 
             to_install = resolver.get_installation_order(requirement_set)
+
+            # Enforce the command-wide expanded-content limits before any
+            # file is written to the target environment. Wheels built from
+            # sdists were already accounted for (and rejected before being
+            # published to the cache) during the build step; reserve the
+            # remaining wheels (downloaded directly or taken from caches)
+            # here. Raising at this point guarantees that the environment is
+            # not modified.
+            for req in to_install:
+                if req.is_wheel and req.local_file_path:
+                    reserve_wheel_extraction(req.local_file_path)
 
             # Check for conflicts in the package set we're installing.
             conflicts: ConflictDetails | None = None

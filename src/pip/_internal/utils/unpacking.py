@@ -9,7 +9,9 @@ import stat
 import sys
 import tarfile
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from zipfile import ZipInfo
 
 from pip._internal.exceptions import InstallationError
@@ -40,6 +42,191 @@ try:
     SUPPORTED_EXTENSIONS += XZ_EXTENSIONS
 except ImportError:
     logger.debug("lzma module is not available")
+
+
+class ExtractionLimitsExceeded(InstallationError):
+    """Raised when a command would unpack more than its configured limits.
+
+    Source distributions and wheels can expand into a file set many times
+    larger than the compressed download. Raising this error aborts the
+    command *before* the offending member is written, so callers can clean
+    up the partially extracted files, skip publishing anything to the wheel
+    cache, and leave the target environment untouched.
+    """
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        limit: int,
+        used: int,
+        archive: str,
+        member: str | None = None,
+    ) -> None:
+        self.kind = kind
+        self.limit = limit
+        self.used = used
+        self.archive = archive
+        self.member = member
+
+        if member is not None:
+            subject = f"member {member!r} of {archive!r}"
+        else:
+            subject = f"{archive!r}"
+        message = (
+            f"The unpacked content {kind} limit of {limit} set for this "
+            f"command would be exceeded while extracting {subject}: "
+            f"{used} {kind} would have been unpacked in total. "
+            "Aborting; partially extracted files have been removed, "
+            "nothing was installed and the wheel cache was not modified."
+        )
+        super().__init__(message)
+
+
+@dataclass
+class _ExtractionBudget:
+    """Command-wide running total of content produced by unpacking.
+
+    Every extracted archive member is charged *before* it is written to
+    disk, using the uncompressed size advertised by the archive metadata,
+    so a single oversized member cannot land on disk first.
+    """
+
+    max_bytes: int | None
+    max_files: int | None
+    used_bytes: int = 0
+    used_files: int = 0
+    # Real paths of wheels whose expansion has already been accounted for,
+    # so a wheel is never counted twice (once when published to the cache
+    # and once when installed into the environment).
+    _reserved_wheels: set[str] = field(default_factory=set)
+
+    def charge(
+        self,
+        num_bytes: int = 0,
+        num_files: int = 0,
+        *,
+        archive: str,
+        member: str | None = None,
+    ) -> None:
+        """Account for ``num_bytes``/``num_files`` before they are written."""
+        would_be_bytes = self.used_bytes + num_bytes
+        would_be_files = self.used_files + num_files
+
+        if self.max_bytes is not None and would_be_bytes > self.max_bytes:
+            raise ExtractionLimitsExceeded(
+                kind="bytes",
+                limit=self.max_bytes,
+                used=would_be_bytes,
+                archive=archive,
+                member=member,
+            )
+        if self.max_files is not None and would_be_files > self.max_files:
+            raise ExtractionLimitsExceeded(
+                kind="files",
+                limit=self.max_files,
+                used=would_be_files,
+                archive=archive,
+                member=member,
+            )
+
+        self.used_bytes = would_be_bytes
+        self.used_files = would_be_files
+
+    def reserve_wheel(self, wheel_path: str, *, key_path: str | None = None) -> None:
+        """Charge for a wheel's expanded content without extracting it.
+
+        The totals are read from the wheel's zip metadata, which is the same
+        metadata used while installing. ``key_path`` allows accounting a wheel
+        under the path it will have *after* it is published to the cache, so a
+        later reservation for that published path is a no-op.
+        """
+        key = os.path.realpath(key_path or wheel_path)
+        if key in self._reserved_wheels:
+            return
+
+        total_bytes, total_files = _wheel_extracted_size(wheel_path)
+        self.charge(
+            total_bytes,
+            total_files,
+            archive=os.path.basename(wheel_path),
+        )
+        self._reserved_wheels.add(key)
+
+
+def _wheel_extracted_size(wheel_path: str) -> tuple[int, int]:
+    """Return ``(uncompressed bytes, file count)`` for a wheel archive."""
+    try:
+        with zipfile.ZipFile(wheel_path, allowZip64=True) as wheel_zip:
+            infos = wheel_zip.infolist()
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise InstallationError(f"Cannot read wheel {wheel_path!r}: {exc}")
+
+    total_bytes = 0
+    total_files = 0
+    for info in infos:
+        if info.is_dir():
+            continue
+        total_bytes += info.file_size
+        total_files += 1
+    return total_bytes, total_files
+
+
+_extraction_budget: _ExtractionBudget | None = None
+
+
+@contextmanager
+def extraction_limits(
+    max_bytes: int | None,
+    max_files: int | None,
+) -> Generator[None, None, None]:
+    """Install a command-wide budget on unpacked bytes and file count.
+
+    The budget applies to every archive extracted while the context is
+    active (sdists and wheels across all requirements), and is removed when
+    the context exits. With both limits unset, extraction is unrestricted.
+    """
+    global _extraction_budget
+
+    if max_bytes is None and max_files is None:
+        yield
+        return
+
+    previous_budget = _extraction_budget
+    _extraction_budget = _ExtractionBudget(max_bytes=max_bytes, max_files=max_files)
+    try:
+        yield
+    finally:
+        _extraction_budget = previous_budget
+
+
+def charge_extraction(
+    num_bytes: int = 0,
+    num_files: int = 0,
+    *,
+    archive: str,
+    member: str | None = None,
+) -> None:
+    """Charge an imminent extraction against the command-wide budget, if any."""
+    if _extraction_budget is not None:
+        _extraction_budget.charge(
+            num_bytes,
+            num_files,
+            archive=archive,
+            member=member,
+        )
+
+
+def reserve_wheel_extraction(
+    wheel_path: str, *, key_path: str | None = None
+) -> None:
+    """Account for a wheel's expansion against the command-wide budget."""
+    if _extraction_budget is not None:
+        _extraction_budget.reserve_wheel(wheel_path, key_path=key_path)
+
+
+def current_extraction_budget() -> _ExtractionBudget | None:
+    return _extraction_budget
 
 
 def current_umask() -> int:
@@ -142,10 +329,17 @@ def unzip_file(filename: str, location: str, flatten: bool = True) -> None:
                     "outside target directory ({})"
                 )
                 raise InstallationError(message.format(filename, fn, location))
+            # Charge before creating anything, using the uncompressed size
+            # advertised in the zip metadata. Directory entries count towards
+            # the file (inode) limit as well.
             if fn.endswith(("/", "\\")):
+                charge_extraction(0, 1, archive=filename, member=name)
                 # A directory
                 ensure_dir(fn)
             else:
+                charge_extraction(
+                    info.file_size, 1, archive=filename, member=name
+                )
                 ensure_dir(dir)
                 # Don't use read() to avoid allocating an arbitrarily large
                 # chunk of memory for the file's content
@@ -251,7 +445,18 @@ def untar_file(filename: str, location: str) -> None:
                     member.mode = None  # type: ignore [assignment]
                 return member
 
-            tar.extractall(location, filter=pip_filter)
+            # Extract member by member instead of using extractall() so each
+            # member can be charged against the command-wide extraction
+            # budget *before* it is written. The security filter has already
+            # been applied by pip_filter, so no filter is applied again.
+            for member in tar.getmembers():
+                member = pip_filter(member, location)
+                # Every member creates a filesystem entry (directories and
+                # links consume an inode too); only regular files have size.
+                charge_extraction(
+                    member.size, 1, archive=filename, member=member.name
+                )
+                tar.extract(member, location, filter="fully_trusted")
 
     finally:
         tar.close()
@@ -286,6 +491,11 @@ def _untar_without_filter(
         if leading:
             fn = split_leading_dir(fn)[1]
         path = os.path.join(location, fn)
+
+        # Charge before creating the member, mirroring the data_filter path.
+        charge_extraction(
+            member.size, 1, archive=filename, member=member.name
+        )
 
         # The plain check rejects textual ".." escapes; resolving symlinks also
         # catches a later member redirected outside by an earlier member's
@@ -378,30 +588,39 @@ def unpack_file(
         untar_file(filename, location)
 
     if content_type == "application/zip":
-        return _unzip()
-    if content_type == "application/x-gzip":
-        return _untar()
+        do_unpack = _unzip
+    elif content_type == "application/x-gzip":
+        do_unpack = _untar
+    elif filename.lower().endswith(ZIP_EXTENSIONS):
+        do_unpack = _unzip
+    elif filename.lower().endswith(TAR_EXTENSIONS + BZ2_EXTENSIONS + XZ_EXTENSIONS):
+        do_unpack = _untar
+    else:
+        # avoid ambiguous case where both signature checks return True
+        is_zipfile = zipfile.is_zipfile(filename)
+        is_tarfile = tarfile.is_tarfile(filename)
+        if is_zipfile and not is_tarfile:
+            do_unpack = _unzip
+        elif is_tarfile and not is_zipfile:
+            do_unpack = _untar
+        else:
+            if is_zipfile and is_tarfile:
+                logger.error("Ambiguous file signature in %s.", filename)
 
-    if filename.lower().endswith(ZIP_EXTENSIONS):
-        return _unzip()
-    if filename.lower().endswith(TAR_EXTENSIONS + BZ2_EXTENSIONS + XZ_EXTENSIONS):
-        return _untar()
+            logger.critical(
+                "Cannot unpack file %s (downloaded from %s, content-type: %s); "
+                "cannot detect archive format",
+                filename,
+                location,
+                content_type,
+            )
+            raise InstallationError(f"Cannot determine archive format of {location}")
 
-    # avoid ambiguous case where both signature checks return True
-    is_zipfile = zipfile.is_zipfile(filename)
-    is_tarfile = tarfile.is_tarfile(filename)
-    if is_zipfile and not is_tarfile:
-        return _unzip()
-    if is_tarfile and not is_zipfile:
-        return _untar()
-    if is_zipfile and is_tarfile:
-        logger.error("Ambiguous file signature in %s.", filename)
-
-    logger.critical(
-        "Cannot unpack file %s (downloaded from %s, content-type: %s); "
-        "cannot detect archive format",
-        filename,
-        location,
-        content_type,
-    )
-    raise InstallationError(f"Cannot determine archive format of {location}")
+    try:
+        do_unpack()
+    except ExtractionLimitsExceeded:
+        # The unpack was aborted mid-way: remove the partially extracted
+        # tree right away so it cannot exhaust disk space or inodes, even
+        # when --no-clean would otherwise keep pip's temporary directories.
+        shutil.rmtree(location, ignore_errors=True)
+        raise

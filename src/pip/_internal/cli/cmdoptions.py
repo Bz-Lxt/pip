@@ -991,6 +991,68 @@ no_cache: Callable[..., Option] = partial(
     help="Disable the cache.",
 )
 
+
+def _handle_non_negative_int(
+    option: Option, opt: str, value: str, parser: OptionParser
+) -> None:
+    """optparse callback parsing a non-negative integer argument."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise_option_error(
+            parser,
+            option=option,
+            msg=f"invalid integer value: {value!r}",
+        )
+    if parsed < 0:
+        raise_option_error(
+            parser,
+            option=option,
+            msg=f"expected a non-negative integer, got {parsed}",
+        )
+    setattr(parser.values, option.dest, parsed)
+
+
+max_unpacked_bytes: Callable[..., Option] = partial(
+    PipOption,
+    "--max-unpacked-bytes",
+    dest="max_unpacked_bytes",
+    metavar="BYTES",
+    action="callback",
+    callback=_handle_non_negative_int,
+    type="string",
+    default=None,
+    help=(
+        "Maximum total number of bytes that downloaded source distributions "
+        "and wheels may occupy after extraction across the whole command. "
+        "Archives can expand to many times their download size; when this "
+        "limit would be exceeded, pip aborts, removes the extracted files, "
+        "and neither installs anything nor writes to the cache. Defaults to "
+        "unlimited."
+    ),
+)
+
+
+max_unpacked_files: Callable[..., Option] = partial(
+    PipOption,
+    "--max-unpacked-files",
+    dest="max_unpacked_files",
+    metavar="COUNT",
+    action="callback",
+    callback=_handle_non_negative_int,
+    type="string",
+    default=None,
+    help=(
+        "Maximum total number of files (filesystem entries) that downloaded "
+        "source distributions and wheels may contain after extraction "
+        "across the whole command. This guards against exhausting available "
+        "inodes with archives containing a huge number of entries. When this "
+        "limit would be exceeded, pip aborts, removes the extracted files, "
+        "and neither installs anything nor writes to the cache. Defaults to "
+        "unlimited."
+    ),
+)
+
 no_deps: Callable[..., Option] = partial(
     Option,
     "--no-deps",
@@ -1375,6 +1437,8 @@ general_group: dict[str, Any] = {
         client_cert,
         cache_dir,
         no_cache,
+        max_unpacked_bytes,
+        max_unpacked_files,
         disable_pip_version_check,
         no_color,
         no_python_version_warning,
