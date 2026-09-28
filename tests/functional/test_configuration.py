@@ -168,6 +168,66 @@ class TestBasicLoading(ConfigurationMixin):
         result = script.pip("config", "debug")
         assert f"{global_config_file}, exists:" in result.stdout
 
+    def _user_config_file(self) -> Path:
+        return Path(get_configuration_files()[kinds.USER][1])
+
+    def test_set_preserves_comments_and_formatting(
+        self, script: PipTestEnvironment
+    ) -> None:
+        """``config set`` only rewrites the targeted line."""
+        config_file = self._user_config_file()
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        original = textwrap.dedent("""\
+            # top comment, must survive
+            [global]
+            # note about timeout
+            timeout = 60
+
+            [freeze]
+            timeout=10
+            """)
+        config_file.write_text(original)
+
+        script.pip("config", "--user", "set", "global.timeout", "90")
+
+        expected = original.replace("timeout = 60", "timeout = 90")
+        assert config_file.read_text() == expected
+
+    def test_repeated_set_is_stable(self, script: PipTestEnvironment) -> None:
+        """Running the same set twice converges on identical file bytes."""
+        config_file = self._user_config_file()
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text("[global]\n")
+
+        script.pip("config", "--user", "set", "global.timeout", "90")
+        after_first = config_file.read_bytes()
+
+        script.pip("config", "--user", "set", "global.timeout", "90")
+        assert config_file.read_bytes() == after_first
+
+    def test_unset_preserves_comments(self, script: PipTestEnvironment) -> None:
+        """``config unset`` removes only the option (and empty section)."""
+        config_file = self._user_config_file()
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        original = textwrap.dedent("""\
+            # top comment, must survive
+            [global]
+            timeout = 60
+
+            [freeze]
+            # freeze note
+            timeout=10
+            """)
+        config_file.write_text(original)
+
+        script.pip("config", "--user", "unset", "freeze.timeout")
+
+        content = config_file.read_text()
+        assert "# top comment, must survive\n" in content
+        assert "# freeze note\n" in content
+        assert "timeout=10\n" not in content
+        assert "[freeze]\n" not in content
+
     def test_editor_does_not_exist(self, script: PipTestEnvironment) -> None:
         """Ensure that FileNotFoundError sets filename correctly"""
         result = script.pip(
